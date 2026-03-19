@@ -4,6 +4,7 @@
   "agent_id": "main",
   "hotkey": "F13",
   "whisper_model": "base",
+  "transcription_language": "auto",
   "tts_voice": "en-US-AriaNeural",
   "tts_rate": "+0%",
   "session_user": "voice-client"

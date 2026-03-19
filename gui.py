@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import threading
+import time
+import traceback
 import tkinter as tk
 import customtkinter as ctk
 import sounddevice as sd
@@ -15,7 +17,8 @@ import asyncio
 
 from recorder import Recorder
 from transcriber import Transcriber
-from client import GatewayClient
+from client import GatewayClient, describe_gateway_status, resolve_chat_completions_url
+from hotkeys import HoldHotkeyBinding, format_hotkey, normalize_hotkey_text, normalize_key_name
 from tts import TTSPipeline
 
 
@@ -30,6 +33,7 @@ DEFAULT_CONFIG = {
     "agent_id": "main",
     "hotkey": "F13",
     "whisper_model": "base",
+    "transcription_language": "auto",
     "tts_voice": "en-US-AriaNeural",
     "tts_rate": "+0%",
     "session_user": "voice-client",
@@ -47,7 +51,24 @@ POPULAR_VOICES = [
     "en-AU-NatashaNeural",
     "en-AU-WilliamNeural",
     "en-CA-ClaraNeural",
+    "nb-NO-PernilleNeural",
+    "nb-NO-FinnNeural",
 ]
+
+TRANSCRIPTION_LANGUAGE_OPTIONS = {
+    "Auto detect": "auto",
+    "English": "en",
+    "Norwegian": "no",
+}
+
+TRANSCRIPTION_LANGUAGE_LABELS = list(TRANSCRIPTION_LANGUAGE_OPTIONS.keys())
+TRANSCRIPTION_LANGUAGE_BY_CODE = {value: label for label, value in TRANSCRIPTION_LANGUAGE_OPTIONS.items()}
+
+
+def get_preview_text(voice: str) -> str:
+    if voice.startswith("nb-NO"):
+        return "Hei, dette er en norsk stemmeprove."
+    return "Hello, this is a voice preview."
 
 
 def load_config():
@@ -71,6 +92,19 @@ def get_audio_devices():
     return inputs, outputs
 
 
+def cleanup_temp_file(path: str, retries: int = 10, delay: float = 0.1) -> bool:
+    """Retry temp-file removal to avoid transient Windows file locks."""
+    for _ in range(retries):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            time.sleep(delay)
+    return False
+
+
 class VoiceApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -87,8 +121,15 @@ class VoiceApp(ctk.CTk):
         self._transcriber = None
         self._gateway = None
         self._tts = None
-        self._hotkey_thread = None
+        self._hotkey_binding = None
+        self._hotkey_capture_hook = None
+        self._captured_hotkey_keys = []
+        self._captured_pressed_keys = set()
+        self._response_cancel_event = None
         self._is_recording = False
+        self._starting = False
+        self._record_started_at = 0.0
+        self._release_after_id = None
 
         self._build_ui()
         self._load_devices()
@@ -163,6 +204,8 @@ class VoiceApp(ctk.CTk):
         ctk.CTkLabel(hk_row, text="Hotkey", width=100, anchor="w").pack(side="left")
         self._hotkey_entry = ctk.CTkEntry(hk_row, placeholder_text="F13")
         self._hotkey_entry.pack(side="left", fill="x", expand=True)
+        self._record_hotkey_btn = ctk.CTkButton(hk_row, text="Record", width=90, command=self._toggle_hotkey_capture)
+        self._record_hotkey_btn.pack(side="left", padx=(8, 0))
 
         # Whisper model
         wm_row = ctk.CTkFrame(tab, fg_color="transparent")
@@ -170,6 +213,12 @@ class VoiceApp(ctk.CTk):
         ctk.CTkLabel(wm_row, text="Whisper model", width=100, anchor="w").pack(side="left")
         self._whisper_menu = ctk.CTkOptionMenu(wm_row, values=WHISPER_MODELS)
         self._whisper_menu.pack(side="left", fill="x", expand=True)
+
+        lang_row = ctk.CTkFrame(tab, fg_color="transparent")
+        lang_row.pack(fill="x", padx=4, pady=4)
+        ctk.CTkLabel(lang_row, text="Transcribe", width=100, anchor="w").pack(side="left")
+        self._transcription_language_menu = ctk.CTkOptionMenu(lang_row, values=TRANSCRIPTION_LANGUAGE_LABELS)
+        self._transcription_language_menu.pack(side="left", fill="x", expand=True)
 
     def _build_audio_tab(self):
         tab = self._tabs.tab("Audio")
@@ -210,7 +259,7 @@ class VoiceApp(ctk.CTk):
 
         fields = [
             ("Gateway URL", "_gw_url", "https://your-openclaw-gateway.example.com", False),
-            ("Gateway token", "_gw_token", "your-token-here", True),
+            ("Gateway auth", "_gw_token", "token or password", True),
             ("Agent ID", "_gw_agent", "main", False),
             ("Session user", "_gw_session", "voice-client", False),
         ]
@@ -228,9 +277,17 @@ class VoiceApp(ctk.CTk):
         # Show/hide token button
         ctk.CTkButton(tab, text="Show/hide token", width=130, command=self._toggle_token).pack(anchor="w", padx=4, pady=6)
 
+        ctk.CTkLabel(
+            tab,
+            text="Use the gateway token by default. If your gateway is set to password mode, enter that password here.",
+            text_color="#888",
+            justify="left",
+            wraplength=480,
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+
         # Connection test button
         ctk.CTkButton(tab, text="🔗  Test connection", command=self._test_connection).pack(anchor="w", padx=4, pady=(16, 4))
-        self._conn_label = ctk.CTkLabel(tab, text="", text_color="#888")
+        self._conn_label = ctk.CTkLabel(tab, text="", text_color="#888", justify="left", wraplength=480)
         self._conn_label.pack(anchor="w", padx=4)
 
     # ─── Device Loading ──────────────────────────────────────────────────────
@@ -276,8 +333,10 @@ class VoiceApp(ctk.CTk):
     def _populate_fields(self):
         c = self.config_data
 
-        self._hotkey_entry.insert(0, c.get("hotkey", "F13"))
+        self._hotkey_entry.insert(0, normalize_hotkey_text(c.get("hotkey", "F13")))
         self._whisper_menu.set(c.get("whisper_model", "base"))
+        language_code = c.get("transcription_language", "auto")
+        self._transcription_language_menu.set(TRANSCRIPTION_LANGUAGE_BY_CODE.get(language_code, "Auto detect"))
 
         voice = c.get("tts_voice", "en-US-AriaNeural")
         if voice not in POPULAR_VOICES:
@@ -309,6 +368,53 @@ class VoiceApp(ctk.CTk):
         current = self._gw_token.cget("show")
         self._gw_token.configure(show="" if current == "●" else "●")
 
+    def _toggle_hotkey_capture(self):
+        if self._hotkey_capture_hook is not None:
+            self._stop_hotkey_capture()
+            return
+
+        if self._voice_running or self._starting:
+            self._set_status("Stop voice mode before recording a new hotkey", "#ff9800")
+            return
+
+        import keyboard as kb
+
+        self._captured_hotkey_keys = []
+        self._captured_pressed_keys = set()
+        self._hotkey_capture_hook = kb.hook(self._handle_hotkey_capture, suppress=False)
+        self._record_hotkey_btn.configure(text="Press keys...")
+        self._set_status("Press the desired hotkey combo and release", "#ff9800")
+
+    def _stop_hotkey_capture(self):
+        import keyboard as kb
+
+        if self._hotkey_capture_hook is not None:
+            kb.unhook(self._hotkey_capture_hook)
+            self._hotkey_capture_hook = None
+        self._record_hotkey_btn.configure(text="Record")
+
+    def _handle_hotkey_capture(self, event):
+        key_name = normalize_key_name(event.name)
+        if not key_name:
+            return
+
+        if event.event_type == "down":
+            self._captured_pressed_keys.add(key_name)
+            if key_name not in self._captured_hotkey_keys:
+                self._captured_hotkey_keys.append(key_name)
+        elif event.event_type == "up":
+            self._captured_pressed_keys.discard(key_name)
+
+        if self._captured_hotkey_keys and not self._captured_pressed_keys:
+            hotkey = format_hotkey(self._captured_hotkey_keys)
+            self.after(0, lambda value=hotkey: self._finish_hotkey_capture(value))
+
+    def _finish_hotkey_capture(self, hotkey):
+        self._stop_hotkey_capture()
+        self._hotkey_entry.delete(0, "end")
+        self._hotkey_entry.insert(0, hotkey)
+        self._set_status(f"Hotkey recorded: {hotkey}", "#4caf50")
+
     def _get_selected_device_index(self, menu, device_list):
         val = menu.get()
         try:
@@ -325,8 +431,9 @@ class VoiceApp(ctk.CTk):
             "gateway_url": self._gw_url.get().strip(),
             "gateway_token": self._gw_token.get().strip(),
             "agent_id": self._gw_agent.get().strip() or "main",
-            "hotkey": self._hotkey_entry.get().strip() or "F13",
+            "hotkey": normalize_hotkey_text(self._hotkey_entry.get().strip() or "F13"),
             "whisper_model": self._whisper_menu.get(),
+            "transcription_language": TRANSCRIPTION_LANGUAGE_OPTIONS[self._transcription_language_menu.get()],
             "tts_voice": self._voice_menu.get(),
             "tts_rate": rate_str,
             "session_user": self._gw_session.get().strip() or "voice-client",
@@ -336,6 +443,8 @@ class VoiceApp(ctk.CTk):
 
         save_config(config)
         self.config_data = config
+        self._hotkey_entry.delete(0, "end")
+        self._hotkey_entry.insert(0, config["hotkey"])
         self._set_status("Settings saved", "#4caf50")
 
     def _preview_voice(self):
@@ -345,23 +454,44 @@ class VoiceApp(ctk.CTk):
 
         def run():
             import tempfile, pygame
+            tmp_path = None
+            started_mixer = False
             try:
                 tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
                 tmp.close()
-                asyncio.run(self._generate_preview(voice, rate_str, tmp.name))
-                pygame.mixer.init()
-                pygame.mixer.music.load(tmp.name)
+                tmp_path = tmp.name
+                asyncio.run(self._generate_preview(voice, rate_str, tmp_path))
+                if not pygame.mixer.get_init():
+                    pygame.mixer.init()
+                    started_mixer = True
+                pygame.mixer.music.load(tmp_path)
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
-                    import time; time.sleep(0.05)
-                os.unlink(tmp.name)
+                    time.sleep(0.05)
             except Exception as e:
                 print(f"[preview] Error: {e}")
+            finally:
+                try:
+                    if pygame.mixer.get_init():
+                        pygame.mixer.music.stop()
+                        if hasattr(pygame.mixer.music, "unload"):
+                            pygame.mixer.music.unload()
+                except Exception:
+                    pass
+
+                if started_mixer:
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
+
+                if tmp_path and not cleanup_temp_file(tmp_path):
+                    print(f"[preview] Warning: could not delete temp file: {tmp_path}")
 
         threading.Thread(target=run, daemon=True).start()
 
     async def _generate_preview(self, voice, rate, path):
-        comm = edge_tts.Communicate("Hello, this is a voice preview.", voice, rate=rate)
+        comm = edge_tts.Communicate(get_preview_text(voice), voice, rate=rate)
         await comm.save(path)
 
     def _test_connection(self):
@@ -370,91 +500,160 @@ class VoiceApp(ctk.CTk):
         agent = self._gw_agent.get().strip() or "main"
 
         if not url or not token:
-            self._conn_label.configure(text="⚠  Fill in gateway URL and token first", text_color="#ff9800")
+            self._conn_label.configure(text="Fill in the gateway URL and auth field first", text_color="#ff9800")
             return
 
-        self._conn_label.configure(text="Testing...", text_color="#888")
+        endpoint = resolve_chat_completions_url(url)
+        self._conn_label.configure(text=f"Testing {endpoint} ...", text_color="#888")
 
         def run():
             import httpx
             try:
                 resp = httpx.post(
-                    url.rstrip("/") + "/v1/chat/completions",
+                    endpoint,
                     headers={"Authorization": f"Bearer {token}", "x-openclaw-agent-id": agent},
                     json={"model": "openclaw", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5},
                     timeout=10.0,
                 )
                 if resp.status_code == 200:
-                    self.after(0, lambda: self._conn_label.configure(text="✅  Connected!", text_color="#4caf50"))
+                    self.after(0, lambda: self._conn_label.configure(text=f"Connected: {endpoint}", text_color="#4caf50"))
                 else:
-                    self.after(0, lambda: self._conn_label.configure(text=f"❌  HTTP {resp.status_code}", text_color="#f44336"))
+                    message = describe_gateway_status(resp.status_code)
+                    self.after(0, lambda: self._conn_label.configure(text=message, text_color="#f44336"))
             except Exception as e:
-                self.after(0, lambda: self._conn_label.configure(text=f"❌  {e}", text_color="#f44336"))
+                self.after(0, lambda: self._conn_label.configure(text=f"Could not reach gateway: {e}", text_color="#f44336"))
 
         threading.Thread(target=run, daemon=True).start()
 
     def _toggle_voice(self):
+        if self._starting:
+            return
         if self._voice_running:
             self._stop_voice()
         else:
             self._start_voice()
 
     def _start_voice(self):
-        import keyboard as kb
-
         self._save_settings()
         c = self.config_data
 
         if not c.get("gateway_url") or not c.get("gateway_token"):
-            self._set_status("Set gateway URL and token first", "#f44336")
+            self._set_status("Set the gateway URL and auth field first", "#f44336")
             return
 
+        self._starting = True
+        self._start_btn.configure(state="disabled", text="Loading...")
+        self._set_status("Initializing models and audio... first run may take a few minutes", "#ff9800")
+        threading.Thread(target=self._initialize_voice_components, args=(c,), daemon=True).start()
+
+    def _initialize_voice_components(self, config):
         try:
-            self._recorder = Recorder(device=c.get("input_device"))
-            self._transcriber = Transcriber(model_size=c.get("whisper_model", "base"))
-            self._gateway = GatewayClient(
-                gateway_url=c["gateway_url"],
-                token=c["gateway_token"],
-                agent_id=c.get("agent_id", "main"),
-                session_user=c.get("session_user", "voice-client"),
+            recorder = Recorder(device=config.get("input_device"))
+            transcriber = Transcriber(
+                model_size=config.get("whisper_model", "base"),
+                language=config.get("transcription_language", "auto"),
             )
-            self._tts = TTSPipeline(
-                voice=c.get("tts_voice", "en-US-AriaNeural"),
-                rate=c.get("tts_rate", "+0%"),
-                output_device=c.get("output_device"),
+            gateway = GatewayClient(
+                gateway_url=config["gateway_url"],
+                token=config["gateway_token"],
+                agent_id=config.get("agent_id", "main"),
+                session_user=config.get("session_user", "voice-client"),
             )
+            tts = TTSPipeline(
+                voice=config.get("tts_voice", "en-US-AriaNeural"),
+                rate=config.get("tts_rate", "+0%"),
+                output_device=config.get("output_device"),
+            )
+            hotkey = config.get("hotkey", "F13")
+            self.after(0, lambda: self._finish_start_voice(recorder, transcriber, gateway, tts, hotkey))
         except Exception as e:
-            self._set_status(f"Init error: {e}", "#f44336")
+            print("[start] Initialization failed:")
+            print(traceback.format_exc())
+            error_message = str(e)
+            self.after(0, lambda message=error_message: self._handle_start_failure(message))
+
+    def _finish_start_voice(self, recorder, transcriber, gateway, tts, hotkey):
+        try:
+            self._recorder = recorder
+            self._transcriber = transcriber
+            self._gateway = gateway
+            self._tts = tts
+            self._voice_running = True
+            self._hotkey_binding = HoldHotkeyBinding(hotkey, self._on_key_press, self._on_key_release)
+            self._hotkey_binding.start()
+        except Exception as e:
+            print("[start] Hotkey hook failed:")
+            print(traceback.format_exc())
+            self._handle_start_failure(str(e))
             return
 
-        hotkey = c.get("hotkey", "F13")
-        self._voice_running = True
-
-        kb.on_press_key(hotkey, self._on_key_press)
-        kb.on_release_key(hotkey, self._on_key_release)
-
-        self._start_btn.configure(text="⏹  Stop", fg_color="#b71c1c", hover_color="#7f1212")
+        self._starting = False
+        self._start_btn.configure(state="normal", text="⏹  Stop", fg_color="#b71c1c", hover_color="#7f1212")
         self._set_status(f"Listening ({hotkey})", "#4caf50")
 
-    def _stop_voice(self):
-        import keyboard as kb
+    def _handle_start_failure(self, message):
+        self._starting = False
         self._voice_running = False
-        kb.unhook_all()
-        self._start_btn.configure(text="▶  Start", fg_color="#1f6aa5", hover_color="#144d7a")
+        if self._hotkey_binding is not None:
+            self._hotkey_binding.stop()
+            self._hotkey_binding = None
+        self._start_btn.configure(state="normal", text="▶  Start", fg_color="#1f6aa5", hover_color="#144d7a")
+        self._set_status(f"Init error: {message}", "#f44336")
+
+    def _stop_voice(self):
+        self._starting = False
+        self._voice_running = False
+        self._interrupt_response_playback()
+        if self._release_after_id is not None:
+            self.after_cancel(self._release_after_id)
+            self._release_after_id = None
+        if self._hotkey_binding is not None:
+            self._hotkey_binding.stop()
+            self._hotkey_binding = None
+        self._start_btn.configure(state="normal", text="▶  Start", fg_color="#1f6aa5", hover_color="#144d7a")
         self._set_status("Stopped", "#888")
         self._mic_label.configure(text="🎙  Hold your hotkey to speak", text_color="#888")
 
     def _on_key_press(self, e):
+        self._interrupt_response_playback()
+        if self._release_after_id is not None:
+            self.after_cancel(self._release_after_id)
+            self._release_after_id = None
         if not self._is_recording and self._voice_running:
             self._is_recording = True
+            self._record_started_at = time.monotonic()
             self.after(0, lambda: self._mic_label.configure(text="🔴  Recording...", text_color="#f44336"))
             self._recorder.start()
 
     def _on_key_release(self, e):
-        if self._is_recording:
-            self._is_recording = False
-            self.after(0, lambda: self._mic_label.configure(text="⏳  Processing...", text_color="#ff9800"))
-            threading.Thread(target=self._process_recording, daemon=True).start()
+        if self._is_recording and self._release_after_id is None:
+            started_at = self._record_started_at
+            self._release_after_id = self.after(60, lambda s=started_at: self._confirm_key_release(s))
+            return
+
+    def _confirm_key_release(self, started_at):
+        import keyboard as kb
+
+        self._release_after_id = None
+        if not self._is_recording or started_at != self._record_started_at:
+            return
+
+        hotkey = self.config_data.get("hotkey", "F13")
+        try:
+            if kb.is_pressed(hotkey):
+                return
+        except Exception:
+            pass
+
+        self._is_recording = False
+        self.after(0, lambda: self._mic_label.configure(text="Processing...", text_color="#ff9800"))
+        threading.Thread(target=self._process_recording, daemon=True).start()
+
+    def _interrupt_response_playback(self):
+        if self._response_cancel_event is not None:
+            self._response_cancel_event.set()
+        if self._tts is not None:
+            self._tts.interrupt()
 
     def _process_recording(self):
         audio_path = self._recorder.stop()
@@ -470,15 +669,26 @@ class VoiceApp(ctk.CTk):
         self._set_transcript(text)
         self.after(0, lambda: self._mic_label.configure(text="💬  Waiting for response...", text_color="#2196f3"))
 
+        cancel_event = threading.Event()
+        self._response_cancel_event = cancel_event
         response_parts = []
         buffer = []
-        for token in self._gateway.send(text):
+        prompt_text = f"voice: {text}"
+        for token in self._gateway.send(prompt_text, stop_event=cancel_event):
+            if cancel_event.is_set():
+                break
             response_parts.append(token)
             buffer = self._tts.feed_token(token, buffer)
             self._append_response("".join(response_parts))
 
-        self._tts.flush(buffer)
-        self.after(0, lambda: self._mic_label.configure(text="🎙  Hold your hotkey to speak", text_color="#888"))
+        if not cancel_event.is_set():
+            self._tts.flush(buffer)
+            self.after(0, lambda: self._mic_label.configure(text="🎙  Hold your hotkey to speak", text_color="#888"))
+        elif not self._is_recording:
+            self.after(0, lambda: self._mic_label.configure(text="🎙  Hold your hotkey to speak", text_color="#888"))
+
+        if self._response_cancel_event is cancel_event:
+            self._response_cancel_event = None
 
     # ─── UI Helpers ──────────────────────────────────────────────────────────
 

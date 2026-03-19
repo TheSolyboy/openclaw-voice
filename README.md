@@ -70,6 +70,7 @@ Edit `config.json`:
   "agent_id": "main",
   "hotkey": "F13",
   "whisper_model": "base",
+  "transcription_language": "auto",
   "tts_voice": "en-US-AriaNeural",
   "tts_rate": "+0%",
   "session_user": "voice-client"
@@ -79,10 +80,11 @@ Edit `config.json`:
 | Key | Description |
 |-----|-------------|
 | `gateway_url` | Your OpenClaw gateway URL |
-| `gateway_token` | Gateway auth token (from OpenClaw config) |
+| `gateway_token` | Gateway auth secret. Use the token by default, or the gateway password if auth mode is `password`. |
 | `agent_id` | Which agent to talk to (usually `main`) |
 | `hotkey` | Key to hold while speaking (e.g. `F13`, `F24`, `caps lock`) |
 | `whisper_model` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
+| `transcription_language` | Speech-to-text language: `auto`, `en`, or `no` |
 | `tts_voice` | Edge TTS voice — see [available voices](https://github.com/rany2/edge-tts#list-of-available-voices) |
 | `tts_rate` | Speech speed: `+0%` normal, `+20%` faster, `-10%` slower |
 | `session_user` | Stable session identifier (keeps conversation history) |
@@ -124,6 +126,8 @@ python main.py
 | `en-US-GuyNeural` | English (US) | Male |
 | `en-GB-SoniaNeural` | English (UK) | British female |
 | `en-AU-NatashaNeural` | English (AU) | Australian female |
+| `nb-NO-PernilleNeural` | Norwegian Bokmal | Female |
+| `nb-NO-FinnNeural` | Norwegian Bokmal | Male |
 
 Run `edge-tts --list-voices` to see all available voices.
 
@@ -131,7 +135,11 @@ Run `edge-tts --list-voices` to see all available voices.
 
 **Mic not detected:** Check your Windows default recording device in Sound settings.
 
-**Gateway connection error:** Verify `gateway_url` and `gateway_token` in config.json.
+**HTTP 401/403 from gateway:** Verify the auth value. Use the gateway token by default, or the gateway password if your OpenClaw auth mode is `password`.
+
+**HTTP 404 from gateway:** The URL is reaching a server, but the OpenAI-compatible endpoint is not there. Check that `chatCompletions` is enabled and that `gateway_url` points at the gateway endpoint host/path.
+
+**Gateway connection error:** Verify `gateway_url` and `gateway_token` in config.json and make sure the host is reachable from this machine.
 
 **Key detection not working:** Try running as administrator (right-click → Run as administrator).
 

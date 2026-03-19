@@ -6,12 +6,12 @@ Hold a key to record, release to send. Hear the response streamed back as speech
 import json
 import os
 import sys
-import keyboard
-import time
+import threading
 
 from recorder import Recorder
 from transcriber import Transcriber
 from client import GatewayClient
+from hotkeys import HoldHotkeyBinding, normalize_hotkey_text
 from tts import TTSPipeline
 
 
@@ -43,11 +43,14 @@ def main():
 
     config = load_config()
 
-    hotkey = config["hotkey"]
+    hotkey = normalize_hotkey_text(config["hotkey"])
     print(f"\nLoading models...")
 
     recorder = Recorder()
-    transcriber = Transcriber(model_size=config.get("whisper_model", "base"))
+    transcriber = Transcriber(
+        model_size=config.get("whisper_model", "base"),
+        language=config.get("transcription_language", "auto"),
+    )
     gateway = GatewayClient(
         gateway_url=config["gateway_url"],
         token=config["gateway_token"],
@@ -63,9 +66,13 @@ def main():
     print("Press Ctrl+C to quit.\n")
 
     is_recording = False
+    response_cancel_event = None
 
     def on_hotkey_press(e):
-        nonlocal is_recording
+        nonlocal is_recording, response_cancel_event
+        if response_cancel_event is not None:
+            response_cancel_event.set()
+        tts.interrupt()
         if not is_recording:
             is_recording = True
             recorder.start()
@@ -74,9 +81,10 @@ def main():
         nonlocal is_recording
         if is_recording:
             is_recording = False
-            process_recording()
+            threading.Thread(target=process_recording, daemon=True).start()
 
     def process_recording():
+        nonlocal response_cancel_event
         audio_path = recorder.stop()
         if not audio_path:
             print("[main] No audio recorded, skipping.")
@@ -91,22 +99,31 @@ def main():
         print("Atlas: ", end="", flush=True)
 
         # Stream response and pipeline through TTS
+        cancel_event = threading.Event()
+        response_cancel_event = cancel_event
         buffer = []
-        for token in gateway.send(text):
+        prompt_text = f"voice: {text}"
+        for token in gateway.send(prompt_text, stop_event=cancel_event):
+            if cancel_event.is_set():
+                break
             print(token, end="", flush=True)
             buffer = tts.feed_token(token, buffer)
 
         # Flush any remaining text
-        tts.flush(buffer)
+        if not cancel_event.is_set():
+            tts.flush(buffer)
+        if response_cancel_event is cancel_event:
+            response_cancel_event = None
         print("\n")
 
     # Register hotkey hooks
-    keyboard.on_press_key(hotkey, on_hotkey_press)
-    keyboard.on_release_key(hotkey, on_hotkey_release)
+    hotkey_binding = HoldHotkeyBinding(hotkey, on_hotkey_press, on_hotkey_release)
+    hotkey_binding.start()
 
     try:
-        keyboard.wait()  # Block forever until Ctrl+C
+        threading.Event().wait()  # Block forever until Ctrl+C
     except KeyboardInterrupt:
+        hotkey_binding.stop()
         print("\n\nGoodbye!")
         sys.exit(0)
 
