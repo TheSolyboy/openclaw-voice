@@ -23,12 +23,19 @@ def split_sentences(text: str) -> list[str]:
 
 
 class TTSPipeline:
-    def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%"):
+    def __init__(self, voice: str = "en-US-AriaNeural", rate: str = "+0%", output_device=None):
         self.voice = voice
         self.rate = rate
         self._audio_queue = Queue()
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
+
+        # Set output device before init if specified
+        if output_device is not None:
+            devices = sd.query_devices()
+            if output_device < len(devices):
+                device_name = devices[output_device]["name"]
+                pygame.mixer.pre_init(devicename=device_name)
 
         pygame.mixer.init()
         print(f"[tts] Initialized with voice: {voice}, rate: {rate}")

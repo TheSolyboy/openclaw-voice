@@ -14,19 +14,21 @@ SAMPLE_RATE = 16000  # 16kHz mono — optimal for Whisper
 
 
 class Recorder:
-    def __init__(self):
+    def __init__(self, device=None):
         self._frames = []
         self._recording = False
         self._stream = None
+        self._device = device  # None = system default
 
     def start(self):
-        """Start recording from the default microphone."""
+        """Start recording from the selected microphone."""
         self._frames = []
         self._recording = True
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
+            device=self._device,
             callback=self._callback,
         )
         self._stream.start()

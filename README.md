@@ -10,6 +10,18 @@ A push-to-talk voice interface for [OpenClaw](https://openclaw.ai). Hold a key â
 4. Text is streamed to your OpenClaw gateway
 5. Response streams back token-by-token, converted to speech sentence-by-sentence as it arrives
 
+## Running
+
+**With GUI (recommended):**
+```bash
+python gui.py
+```
+
+**Headless (no UI):**
+```bash
+python main.py
+```
+
 ## Requirements
 
 - Windows 10/11
